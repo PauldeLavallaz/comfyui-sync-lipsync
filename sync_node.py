@@ -1,6 +1,6 @@
-import time, json, requests, os, tempfile, subprocess
+import time, json, requests, os, tempfile
 from pathlib import Path
-
+from os.path import getsize
 
 # ─────────────── API KEY NODE ──────────────────────────────────────────────
 class SyncApiKeyNode:
@@ -21,146 +21,247 @@ class SyncApiKeyNode:
         return ({"api_key": api_key},)
 
 
-# ─────────────── LIPSYNC NODE (VIDEO in / VIDEO out) ───────────────────────
-class SyncLipsyncNode:
-    """
-    Accepts native VIDEO + AUDIO, outputs native VIDEO.
-    Works with ComfyUI's native Load Video and Save Video nodes.
-    VIDEO type = file path string (as used by native ComfyUI video nodes).
-    """
+# ─────────────── VIDEO INPUT NODE ──────────────────────────────────────────
+class SyncVideoInputNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "video":      ("VIDEO",),
+                "video_path": ("STRING", {"default": ""}),
+                "video_url":  ("STRING", {"default": ""}),
+            }
+        }
 
+    RETURN_TYPES = ("SYNC_VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "provide_video"
+    CATEGORY = "Sync.so/Lipsync"
+
+    def provide_video(self, video=None, video_path="", video_url=""):
+        if video is not None:
+            return self._resolve_video(video)
+
+        if video_path and os.path.exists(video_path):
+            return ({"video_path": video_path, "type": "path"},)
+
+        if video_url:
+            return ({"video_url": video_url, "type": "url"},)
+
+        return ({"video_path": "", "type": "path"},)
+
+    def _resolve_video(self, video):
+        # New ComfyUI API: VideoFromFile has save_to()
+        if hasattr(video, 'save_to'):
+            tmpdir = tempfile.mkdtemp()
+            temp_path = os.path.join(tmpdir, "input_video.mp4")
+            video.save_to(temp_path)
+            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                print(f"[Sync] VideoFromFile saved to: {temp_path}")
+                return ({"video_path": temp_path, "type": "path"},)
+            raise ValueError("Failed to save VideoFromFile")
+
+        # Plain path string
+        if isinstance(video, str) and os.path.exists(video):
+            return ({"video_path": video, "type": "path"},)
+
+        # Dict with path
+        if isinstance(video, dict):
+            if "path" in video and os.path.exists(video["path"]):
+                return ({"video_path": video["path"], "type": "path"},)
+            if "video_path" in video:
+                return (video, )
+
+        raise ValueError(f"Cannot resolve video from type: {type(video)}")
+
+
+# ─────────────── AUDIO INPUT NODE ──────────────────────────────────────────
+class SyncAudioInputNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "audio":      ("AUDIO",),
+                "audio_path": ("STRING", {"default": ""}),
+                "audio_url":  ("STRING", {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("SYNC_AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "provide_audio"
+    CATEGORY = "Sync.so/Lipsync"
+
+    def provide_audio(self, audio=None, audio_path="", audio_url=""):
+        if audio is not None:
+            return self._resolve_audio(audio)
+
+        if audio_path and os.path.exists(audio_path):
+            return ({"audio_path": audio_path, "type": "path"},)
+
+        if audio_url:
+            return ({"audio_url": audio_url, "type": "url"},)
+
+        return ({"audio_path": "", "type": "path"},)
+
+    def _resolve_audio(self, audio):
+        # New ComfyUI API: AudioFromFile has save_to()
+        if hasattr(audio, 'save_to'):
+            tmpdir = tempfile.mkdtemp()
+            temp_path = os.path.join(tmpdir, "input_audio.wav")
+            audio.save_to(temp_path)
+            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                return ({"audio_path": temp_path, "type": "path"},)
+            raise ValueError("Failed to save AudioFromFile")
+
+        # Dict format (waveform/sample_rate)
+        if isinstance(audio, dict) and ("waveform" in audio or "audio" in audio):
+            import numpy as np, soundfile as sf
+            tmpdir = tempfile.mkdtemp()
+            temp_path = os.path.join(tmpdir, "input_audio.wav")
+            wv = audio.get("waveform", audio.get("audio"))
+            sr = audio.get("sample_rate", 44100)
+            wv_np = wv.squeeze(0).cpu().numpy() if hasattr(wv, 'cpu') else wv
+            if len(wv_np.shape) == 2:
+                wv_np = wv_np.mean(axis=0) if wv_np.shape[0] > 1 else wv_np[0]
+            sf.write(temp_path, wv_np, sr)
+            return ({"audio_path": temp_path, "type": "path"},)
+
+        if isinstance(audio, str) and os.path.exists(audio):
+            return ({"audio_path": audio, "type": "path"},)
+
+        raise ValueError(f"Cannot resolve audio from type: {type(audio)}")
+
+
+# ─────────────── GENERATE NODE ─────────────────────────────────────────────
+class SyncLipsyncMainNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key":   ("SYNC_API_KEY", {"forceInput": True}),
-                "video":     ("VIDEO",),
-                "audio":     ("AUDIO",),
-                "model":     (["lipsync-2-pro", "lipsync-2", "lipsync-1.9.0-beta"],),
-                "sync_mode": (["cut_off", "loop", "bounce", "silence", "remap"], {"default": "cut_off"}),
+                "api_key":            ("SYNC_API_KEY", {"forceInput": True}),
+                "video":              ("SYNC_VIDEO",   {"forceInput": True}),
+                "audio":              ("SYNC_AUDIO",   {"forceInput": True}),
+                "model":              (["lipsync-2-pro", "lipsync-2", "lipsync-1.9.0-beta"],),
+                "sync_mode":          (["cut_off", "loop", "bounce", "silence", "remap"], {"default": "cut_off"}),
+                "temperature":        ("FLOAT",   {"default": 0.5, "min": 0.0, "max": 1.0}),
+                "active_speaker":     ("BOOLEAN", {"default": False}),
+                "occlusion_detection":("BOOLEAN", {"default": False}),
             }
         }
 
     RETURN_TYPES  = ("VIDEO",)
     RETURN_NAMES  = ("video",)
-    FUNCTION      = "lipsync"
+    FUNCTION      = "lipsync_generate"
     CATEGORY      = "Sync.so/Lipsync"
 
-    def lipsync(self, api_key, video, audio, model, sync_mode):
-        import soundfile as sf
-        import numpy as np
+    def lipsync_generate(self, api_key, video, audio, model, sync_mode,
+                         temperature, active_speaker, occlusion_detection):
 
-        api_key_str = api_key.get("api_key", "")
-        if not api_key_str:
-            raise ValueError("sync.so API key is required")
+        api_key_str   = api_key["api_key"]
+        headers       = {"x-api-key": api_key_str, "x-sync-source": "comfyui"}
+        MAX_BYTES     = 20 * 1024 * 1024
 
-        headers = {"x-api-key": api_key_str, "x-sync-source": "comfyui"}
-        tmpdir  = tempfile.mkdtemp()
+        video_path = video.get("video_path", "")
+        video_url  = video.get("video_url",  "")
+        audio_path = audio.get("audio_path", "")
+        audio_url  = audio.get("audio_url",  "")
 
-        # ── 1. Resolve video path ─────────────────────────────────────────
-        # Native ComfyUI VIDEO type is a file path string
-        if isinstance(video, str):
-            video_path = video
-        elif isinstance(video, dict) and "path" in video:
-            video_path = video["path"]
-        elif hasattr(video, "video_path"):
-            video_path = video.video_path
-        else:
-            raise ValueError(f"Cannot resolve video path from type: {type(video)}")
-
-        if not os.path.exists(video_path):
-            # Try ComfyUI input folder
-            import folder_paths
-            candidate = os.path.join(folder_paths.get_input_directory(), video_path)
-            if os.path.exists(candidate):
-                video_path = candidate
-            else:
-                raise ValueError(f"Video file not found: {video_path}")
-
-        print(f"[Sync] Video input: {video_path}")
-
-        # ── 2. Write audio → temp WAV ─────────────────────────────────────
-        audio_path = os.path.join(tmpdir, "input_audio.wav")
-        waveform    = audio["waveform"]    # tensor (1, C, T) or (C, T)
-        sample_rate = audio["sample_rate"]
-        wv = waveform.squeeze(0).cpu().numpy()
-        if len(wv.shape) == 2 and wv.shape[0] > 1:
-            wv = wv.mean(axis=0)
-        elif len(wv.shape) == 2:
-            wv = wv[0]
-        sf.write(audio_path, wv, sample_rate)
-        print(f"[Sync] Audio written: sr={sample_rate}")
-
-        # ── 3. Submit to sync.so API ──────────────────────────────────────
+        # ── Submit ────────────────────────────────────────────────────────
         input_block = [{"type": "video"}, {"type": "audio"}]
         fields = [
-            ("model",         model),
-            ("sync_mode",     sync_mode),
-            ("temperature",   "0.5"),
-            ("active_speaker","false"),
-            ("input",         json.dumps(input_block)),
+            ("model",          model),
+            ("sync_mode",      sync_mode),
+            ("temperature",    str(temperature)),
+            ("active_speaker", str(active_speaker).lower()),
+            ("input",          json.dumps(input_block)),
         ]
-        files = {
-            "video": open(video_path, "rb"),
-            "audio": open(audio_path, "rb"),
-        }
-        print("[Sync] Submitting job...")
-        res = requests.post("https://api.sync.so/v2/generate", headers=headers, data=fields, files=files)
-        files["video"].close()
-        files["audio"].close()
+        if occlusion_detection:
+            fields.append(("active_speaker_detection",
+                           json.dumps({"occlusion_detection_enabled": True})))
+
+        files = {}
+        if video_path and Path(video_path).exists():
+            files["video"] = open(video_path, "rb")
+        elif video_url:
+            fields.append(("video_url", video_url))
+
+        if audio_path and Path(audio_path).exists():
+            files["audio"] = open(audio_path, "rb")
+        elif audio_url:
+            fields.append(("audio_url", audio_url))
+
+        print(f"[Sync] Submitting job — model={model}")
+        res = requests.post("https://api.sync.so/v2/generate",
+                            headers=headers, data=fields, files=files or None)
+        for f in files.values():
+            f.close()
 
         if res.status_code != 200:
             raise RuntimeError(f"sync.so error {res.status_code}: {res.text[:400]}")
 
         job_id = res.json()["id"]
-        print(f"[Sync] Job submitted: {job_id}")
+        print(f"[Sync] Job ID: {job_id}")
 
-        # ── 4. Poll until done ────────────────────────────────────────────
+        # ── Poll ──────────────────────────────────────────────────────────
         status = None
-        poll_response = None
+        poll_res = None
         while status not in {"COMPLETED", "FAILED"}:
             time.sleep(5)
-            poll_response = requests.get(f"https://api.sync.so/v2/generate/{job_id}", headers=headers)
-            poll_response.raise_for_status()
-            status = poll_response.json()["status"]
+            poll_res = requests.get(f"https://api.sync.so/v2/generate/{job_id}",
+                                    headers=headers)
+            poll_res.raise_for_status()
+            status = poll_res.json()["status"]
             print(f"[Sync] Status: {status}")
 
         if status != "COMPLETED":
-            raise RuntimeError(f"sync.so job failed. Status: {status}")
+            raise RuntimeError(f"sync.so job failed: {status}")
 
-        # ── 5. Download result ────────────────────────────────────────────
-        result_data = poll_response.json()
-        output_url  = result_data.get("outputUrl") or (result_data.get("result") or {}).get("outputUrl")
+        # ── Download ──────────────────────────────────────────────────────
+        result      = poll_res.json()
+        output_url  = result.get("outputUrl") or (result.get("result") or {}).get("outputUrl")
         if not output_url:
-            raise RuntimeError("sync.so returned no outputUrl")
+            raise RuntimeError("sync.so: no outputUrl in response")
 
-        # Save to ComfyUI output folder
         try:
             import folder_paths
-            output_dir = folder_paths.get_output_directory()
+            out_dir = folder_paths.get_output_directory()
         except Exception:
-            output_dir = tmpdir
+            out_dir = tempfile.mkdtemp()
 
-        output_filename = f"sync_lipsync_{job_id}.mp4"
-        output_path     = os.path.join(output_dir, output_filename)
-
+        out_path = os.path.join(out_dir, f"sync_{job_id}.mp4")
         r = requests.get(output_url)
         r.raise_for_status()
-        Path(output_path).write_bytes(r.content)
-        print(f"[Sync] Result saved → {output_path}")
+        Path(out_path).write_bytes(r.content)
+        print(f"[Sync] Saved → {out_path}")
 
-        return (output_path,)
+        # ── Return as VIDEO type ──────────────────────────────────────────
+        # Try new ComfyUI API VideoFromFile first
+        try:
+            from comfy_api.latest._input_impl.video_types import VideoFromFile
+            return (VideoFromFile(out_path),)
+        except ImportError:
+            pass
+
+        # Fallback: return path string (older ComfyUI)
+        return (out_path,)
 
 
 # ────────────── REGISTER ──────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
-    "SyncApiKeyNode":  SyncApiKeyNode,
-    "SyncLipsyncNode": SyncLipsyncNode,
+    "SyncApiKeyNode":      SyncApiKeyNode,
+    "SyncVideoInputNode":  SyncVideoInputNode,
+    "SyncAudioInputNode":  SyncAudioInputNode,
+    "SyncLipsyncMainNode": SyncLipsyncMainNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SyncApiKeyNode":  "sync.so – API Key",
-    "SyncLipsyncNode": "sync.so – Lipsync",
+    "SyncApiKeyNode":      "sync.so – API Key",
+    "SyncVideoInputNode":  "sync.so – Video Input",
+    "SyncAudioInputNode":  "sync.so – Audio Input",
+    "SyncLipsyncMainNode": "sync.so – Lipsync Generate",
 }
 
 print("[Sync.so] Nodes loaded.")
