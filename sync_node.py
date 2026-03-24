@@ -1,5 +1,6 @@
-import time, json, requests, os, tempfile
+import time, json, requests, os, tempfile, subprocess
 from pathlib import Path
+
 
 # ─────────────── API KEY NODE ──────────────────────────────────────────────
 class SyncApiKeyNode:
@@ -20,34 +21,34 @@ class SyncApiKeyNode:
         return ({"api_key": api_key},)
 
 
-# ─────────────── MAIN LIPSYNC NODE ─────────────────────────────────────────
+# ─────────────── LIPSYNC NODE (VIDEO in / VIDEO out) ───────────────────────
 class SyncLipsyncNode:
     """
-    Unified node: accepts IMAGE frames + AUDIO directly.
-    Uploads to sync.so API, polls for result, returns IMAGE frames.
-    Connect output IMAGE to VHS_SaveVideo or any Save Video node.
+    Accepts native VIDEO + AUDIO, outputs native VIDEO.
+    Works with ComfyUI's native Load Video and Save Video nodes.
+    VIDEO type = file path string (as used by native ComfyUI video nodes).
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key":  ("SYNC_API_KEY", {"forceInput": True}),
-                "images":   ("IMAGE",),        # from Load Video (VHS) or any IMAGE source
-                "audio":    ("AUDIO",),        # from Load Audio or any AUDIO source
-                "fps":      ("FLOAT",  {"default": 25.0, "min": 1.0, "max": 60.0}),
-                "model":    (["lipsync-2-pro", "lipsync-2", "lipsync-1.9.0-beta"],),
-                "sync_mode":(["cut_off", "loop", "bounce", "silence", "remap"], {"default": "cut_off"}),
+                "api_key":   ("SYNC_API_KEY", {"forceInput": True}),
+                "video":     ("VIDEO",),
+                "audio":     ("AUDIO",),
+                "model":     (["lipsync-2-pro", "lipsync-2", "lipsync-1.9.0-beta"],),
+                "sync_mode": (["cut_off", "loop", "bounce", "silence", "remap"], {"default": "cut_off"}),
             }
         }
 
-    RETURN_TYPES  = ("IMAGE", "VHS_AUDIO", "FLOAT", "STRING")
-    RETURN_NAMES  = ("images", "audio", "frame_rate", "output_path")
+    RETURN_TYPES  = ("VIDEO",)
+    RETURN_NAMES  = ("video",)
     FUNCTION      = "lipsync"
     CATEGORY      = "Sync.so/Lipsync"
 
-    def lipsync(self, api_key, images, audio, fps, model, sync_mode):
-        import torch, numpy as np, cv2, soundfile as sf
+    def lipsync(self, api_key, video, audio, model, sync_mode):
+        import soundfile as sf
+        import numpy as np
 
         api_key_str = api_key.get("api_key", "")
         if not api_key_str:
@@ -56,37 +57,48 @@ class SyncLipsyncNode:
         headers = {"x-api-key": api_key_str, "x-sync-source": "comfyui"}
         tmpdir  = tempfile.mkdtemp()
 
-        # ── 1. Write video frames → temp MP4 ──────────────────────────────
-        video_path = os.path.join(tmpdir, "input_video.mp4")
-        frames_np  = (images.cpu().numpy() * 255).astype(np.uint8)  # (N,H,W,3)
-        N, H, W, _ = frames_np.shape
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(video_path, fourcc, fps, (W, H))
-        for i in range(N):
-            writer.write(cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR))
-        writer.release()
-        print(f"[Sync] Video written: {N} frames @ {fps}fps → {video_path}")
+        # ── 1. Resolve video path ─────────────────────────────────────────
+        # Native ComfyUI VIDEO type is a file path string
+        if isinstance(video, str):
+            video_path = video
+        elif isinstance(video, dict) and "path" in video:
+            video_path = video["path"]
+        elif hasattr(video, "video_path"):
+            video_path = video.video_path
+        else:
+            raise ValueError(f"Cannot resolve video path from type: {type(video)}")
+
+        if not os.path.exists(video_path):
+            # Try ComfyUI input folder
+            import folder_paths
+            candidate = os.path.join(folder_paths.get_input_directory(), video_path)
+            if os.path.exists(candidate):
+                video_path = candidate
+            else:
+                raise ValueError(f"Video file not found: {video_path}")
+
+        print(f"[Sync] Video input: {video_path}")
 
         # ── 2. Write audio → temp WAV ─────────────────────────────────────
         audio_path = os.path.join(tmpdir, "input_audio.wav")
-        waveform   = audio["waveform"]   # (1, C, T) or (C, T) tensor
+        waveform    = audio["waveform"]    # tensor (1, C, T) or (C, T)
         sample_rate = audio["sample_rate"]
-        wv = waveform.squeeze(0).cpu().numpy()  # (C, T)
-        if wv.shape[0] > 1:
-            wv = wv.mean(axis=0)           # stereo → mono
-        else:
+        wv = waveform.squeeze(0).cpu().numpy()
+        if len(wv.shape) == 2 and wv.shape[0] > 1:
+            wv = wv.mean(axis=0)
+        elif len(wv.shape) == 2:
             wv = wv[0]
         sf.write(audio_path, wv, sample_rate)
-        print(f"[Sync] Audio written: sr={sample_rate} → {audio_path}")
+        print(f"[Sync] Audio written: sr={sample_rate}")
 
         # ── 3. Submit to sync.so API ──────────────────────────────────────
         input_block = [{"type": "video"}, {"type": "audio"}]
         fields = [
-            ("model",        model),
-            ("sync_mode",    sync_mode),
-            ("temperature",  "0.5"),
+            ("model",         model),
+            ("sync_mode",     sync_mode),
+            ("temperature",   "0.5"),
             ("active_speaker","false"),
-            ("input",        json.dumps(input_block)),
+            ("input",         json.dumps(input_block)),
         ]
         files = {
             "video": open(video_path, "rb"),
@@ -94,7 +106,8 @@ class SyncLipsyncNode:
         }
         print("[Sync] Submitting job...")
         res = requests.post("https://api.sync.so/v2/generate", headers=headers, data=fields, files=files)
-        files["video"].close(); files["audio"].close()
+        files["video"].close()
+        files["audio"].close()
 
         if res.status_code != 200:
             raise RuntimeError(f"sync.so error {res.status_code}: {res.text[:400]}")
@@ -121,42 +134,33 @@ class SyncLipsyncNode:
         if not output_url:
             raise RuntimeError("sync.so returned no outputUrl")
 
-        output_path = os.path.join(tmpdir, f"sync_output_{job_id}.mp4")
+        # Save to ComfyUI output folder
+        try:
+            import folder_paths
+            output_dir = folder_paths.get_output_directory()
+        except Exception:
+            output_dir = tmpdir
+
+        output_filename = f"sync_lipsync_{job_id}.mp4"
+        output_path     = os.path.join(output_dir, output_filename)
+
         r = requests.get(output_url)
         r.raise_for_status()
         Path(output_path).write_bytes(r.content)
-        print(f"[Sync] Downloaded result → {output_path}")
+        print(f"[Sync] Result saved → {output_path}")
 
-        # ── 6. Decode result video → IMAGE tensor ─────────────────────────
-        cap = cv2.VideoCapture(output_path)
-        out_frames = []
-        result_fps = cap.get(cv2.CAP_PROP_FPS) or fps
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            out_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0)
-        cap.release()
-        print(f"[Sync] Decoded {len(out_frames)} output frames")
-
-        out_tensor = torch.from_numpy(np.array(out_frames))  # (N,H,W,3) float32
-
-        # ── 7. Build VHS_AUDIO passthrough (original audio) ──────────────
-        def vhs_audio_passthrough():
-            return audio.get("waveform"), audio.get("sample_rate")
-
-        return (out_tensor, lambda: (audio["waveform"], audio["sample_rate"]), result_fps, output_path)
+        return (output_path,)
 
 
 # ────────────── REGISTER ──────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
-    "SyncApiKeyNode":   SyncApiKeyNode,
-    "SyncLipsyncNode":  SyncLipsyncNode,
+    "SyncApiKeyNode":  SyncApiKeyNode,
+    "SyncLipsyncNode": SyncLipsyncNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SyncApiKeyNode":   "sync.so – API Key",
-    "SyncLipsyncNode":  "sync.so – Lipsync",
+    "SyncApiKeyNode":  "sync.so – API Key",
+    "SyncLipsyncNode": "sync.so – Lipsync",
 }
 
-print("[Sync.so] Nodes loaded: API Key + Lipsync")
+print("[Sync.so] Nodes loaded.")
