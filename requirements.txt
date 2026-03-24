@@ -1,8 +1,3 @@
-requests==2.32.3
-syncsdk==0.1.9
-protobuf<6.0.0,>=3.20.3
-opencv-python-headless
-librosa
+requests
 soundfile
-torch
-numpy
+opencv-python-headless
