@@ -199,7 +199,7 @@ class SyncLipsyncMainNode:
         for f in files.values():
             f.close()
 
-        if res.status_code != 200:
+        if res.status_code not in (200, 201):
             raise RuntimeError(f"sync.so error {res.status_code}: {res.text[:400]}")
 
         job_id = res.json()["id"]
