@@ -170,35 +170,51 @@ class SyncLipsyncMainNode:
         audio_url  = audio.get("audio_url",  "")
 
         # ── Submit ────────────────────────────────────────────────────────
-        input_block = [{"type": "video"}, {"type": "audio"}]
-        fields = [
-            ("model",          model),
-            ("sync_mode",      sync_mode),
-            ("temperature",    str(temperature)),
-            ("active_speaker", str(active_speaker).lower()),
-            ("input",          json.dumps(input_block)),
-        ]
+        # Build options (camelCase keys to match SDK/API)
+        options = {
+            "syncMode": sync_mode,
+            "temperature": temperature,
+        }
+        if active_speaker:
+            options["activeSpeakerDetection"] = {"autoDetect": True}
         if occlusion_detection:
-            fields.append(("active_speaker_detection",
-                           json.dumps({"occlusion_detection_enabled": True})))
+            options["occlusionDetectionEnabled"] = True
 
+        # Determine if we upload files or use URLs
         files = {}
-        if video_path and Path(video_path).exists():
-            files["video"] = open(video_path, "rb")
-        elif video_url:
-            fields.append(("video_url", video_url))
+        has_video_file = video_path and Path(video_path).exists()
+        has_audio_file = audio_path and Path(audio_path).exists()
 
-        if audio_path and Path(audio_path).exists():
+        if has_video_file:
+            files["video"] = open(video_path, "rb")
+        if has_audio_file:
             files["audio"] = open(audio_path, "rb")
-        elif audio_url:
-            fields.append(("audio_url", audio_url))
+
+        # Build form fields — omit `input` when uploading files (per SDK)
+        fields = [("model", model)]
+
+        if options:
+            fields.append(("options", json.dumps(options)))
+
+        # Only provide `input` array for URL-based inputs (not for file uploads)
+        if not has_video_file and video_url:
+            input_block = [{"type": "video", "url": video_url}]
+            if not has_audio_file and audio_url:
+                input_block.append({"type": "audio", "url": audio_url})
+            fields.append(("input", json.dumps(input_block)))
+        elif not has_audio_file and audio_url:
+            input_block = [{"type": "audio", "url": audio_url}]
+            fields.append(("input", json.dumps(input_block)))
 
         print(f"[Sync] Submitting job — model={model}")
+        print(f"[Sync] Fields: {[(k, v[:80] if isinstance(v, str) else v) for k, v in fields]}")
+        print(f"[Sync] Files: {list(files.keys())}")
         res = requests.post("https://api.sync.so/v2/generate",
                             headers=headers, data=fields, files=files or None)
         for f in files.values():
             f.close()
 
+        print(f"[Sync] Response {res.status_code}: {res.text[:500]}")
         if res.status_code not in (200, 201):
             raise RuntimeError(f"sync.so error {res.status_code}: {res.text[:400]}")
 
