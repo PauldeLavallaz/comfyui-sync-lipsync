@@ -169,6 +169,32 @@ class SyncLipsyncMainNode:
         audio_path = audio.get("audio_path", "")
         audio_url  = audio.get("audio_url",  "")
 
+        # ── Auto-compress video if over 20 MB ─────────────────────────────
+        if video_path and Path(video_path).exists():
+            size = os.path.getsize(video_path)
+            if size > MAX_BYTES:
+                print(f"[Sync] Video is {size//1024//1024}MB — compressing to H.264 (limit 20MB)...")
+                import shutil
+                ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg" or "/usr/local/bin/ffmpeg"
+                if not ffmpeg or not os.path.exists(ffmpeg):
+                    raise RuntimeError(
+                        f"Video is {size//1024//1024}MB but sync.so limit is 20MB. "
+                        "Install ffmpeg to auto-compress, or use a shorter/smaller video."
+                    )
+                compressed = video_path.replace(".mp4", "_sync_compressed.mp4")
+                import subprocess
+                result = subprocess.run([
+                    ffmpeg, "-y", "-i", video_path,
+                    "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                    "-c:a", "aac", "-b:a", "128k",
+                    compressed
+                ], capture_output=True, timeout=120)
+                if result.returncode != 0 or not os.path.exists(compressed):
+                    raise RuntimeError(f"ffmpeg compression failed: {result.stderr.decode()[:200]}")
+                new_size = os.path.getsize(compressed)
+                print(f"[Sync] Compressed: {size//1024//1024}MB → {new_size//1024//1024}MB")
+                video_path = compressed
+
         # ── Submit ────────────────────────────────────────────────────────
         # Build options (camelCase keys to match SDK/API)
         options = {
