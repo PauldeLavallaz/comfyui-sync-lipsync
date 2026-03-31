@@ -196,15 +196,15 @@ class SyncLipsyncMainNode:
                 video_path = compressed
 
         # ── Submit ────────────────────────────────────────────────────────
-        # Build options (camelCase keys to match SDK/API)
+        # Build options (snake_case as expected by the multipart endpoint)
         options = {
-            "syncMode": sync_mode,
+            "sync_mode": sync_mode,
             "temperature": temperature,
         }
         if active_speaker:
-            options["activeSpeakerDetection"] = {"autoDetect": True}
+            options["active_speaker_detection"] = {"auto_detect": True}
         if occlusion_detection:
-            options["occlusionDetectionEnabled"] = True
+            options["occlusion_detection_enabled"] = True
 
         # Determine if we upload files or use URLs
         files = {}
