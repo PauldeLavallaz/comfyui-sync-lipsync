@@ -207,38 +207,51 @@ class SyncLipsyncMainNode:
             options["occlusion_detection_enabled"] = True
 
         # Determine if we upload files or use URLs
-        files = {}
         has_video_file = video_path and Path(video_path).exists()
         has_audio_file = audio_path and Path(audio_path).exists()
 
+        # Build multipart files with explicit filename + content-type tuples
+        # Format: field_name → (filename, file_obj, content_type)
+        multipart_files = []
+        opened_files = []
+
         if has_video_file:
-            files["video"] = open(video_path, "rb")
+            f = open(video_path, "rb")
+            opened_files.append(f)
+            multipart_files.append(("video", (Path(video_path).name, f, "video/mp4")))
         if has_audio_file:
-            files["audio"] = open(audio_path, "rb")
+            ext = Path(audio_path).suffix.lower()
+            mime = {"mp3": "audio/mpeg", "wav": "audio/wav",
+                    "ogg": "audio/ogg",  "m4a": "audio/mp4"}.get(ext.lstrip("."), "audio/mpeg")
+            f = open(audio_path, "rb")
+            opened_files.append(f)
+            multipart_files.append(("audio", (Path(audio_path).name, f, mime)))
 
         # Build form fields — omit `input` when uploading files (per SDK)
-        fields = [("model", model)]
+        multipart_data = [("model", model), ("options", json.dumps(options))]
 
-        if options:
-            fields.append(("options", json.dumps(options)))
-
-        # Only provide `input` array for URL-based inputs (not for file uploads)
+        # Only include `input` for URL-based inputs
         if not has_video_file and video_url:
             input_block = [{"type": "video", "url": video_url}]
             if not has_audio_file and audio_url:
                 input_block.append({"type": "audio", "url": audio_url})
-            fields.append(("input", json.dumps(input_block)))
+            multipart_data.append(("input", json.dumps(input_block)))
         elif not has_audio_file and audio_url:
-            input_block = [{"type": "audio", "url": audio_url}]
-            fields.append(("input", json.dumps(input_block)))
+            multipart_data.append(("input", json.dumps([{"type": "audio", "url": audio_url}])))
 
-        print(f"[Sync] Submitting job — model={model}")
-        print(f"[Sync] Fields: {[(k, v[:80] if isinstance(v, str) else v) for k, v in fields]}")
-        print(f"[Sync] Files: {list(files.keys())}")
-        res = requests.post("https://api.sync.so/v2/generate",
-                            headers=headers, data=fields, files=files or None)
-        for f in files.values():
-            f.close()
+        print(f"[Sync] Submitting — model={model} files={[f[0] for f in multipart_files]}")
+        print(f"[Sync] Options: {json.dumps(options)}")
+
+        try:
+            res = requests.post(
+                "https://api.sync.so/v2/generate",
+                headers=headers,
+                data=multipart_data,
+                files=multipart_files if multipart_files else None,
+            )
+        finally:
+            for f in opened_files:
+                f.close()
 
         print(f"[Sync] Response {res.status_code}: {res.text[:500]}")
         if res.status_code not in (200, 201):
