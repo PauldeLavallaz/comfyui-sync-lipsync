@@ -169,36 +169,91 @@ class SyncLipsyncMainNode:
         audio_path = audio.get("audio_path", "")
         audio_url  = audio.get("audio_url",  "")
 
-        # ── Submit ────────────────────────────────────────────────────────
-        input_block = [{"type": "video"}, {"type": "audio"}]
-        fields = [
-            ("model",          model),
-            ("sync_mode",      sync_mode),
-            ("temperature",    str(temperature)),
-            ("active_speaker", str(active_speaker).lower()),
-            ("input",          json.dumps(input_block)),
-        ]
-        if occlusion_detection:
-            fields.append(("active_speaker_detection",
-                           json.dumps({"occlusion_detection_enabled": True})))
-
-        files = {}
+        # ── Auto-compress video if over 20 MB ─────────────────────────────
         if video_path and Path(video_path).exists():
-            files["video"] = open(video_path, "rb")
-        elif video_url:
-            fields.append(("video_url", video_url))
+            size = os.path.getsize(video_path)
+            if size > MAX_BYTES:
+                print(f"[Sync] Video is {size//1024//1024}MB — compressing to H.264 (limit 20MB)...")
+                import shutil
+                ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg" or "/usr/local/bin/ffmpeg"
+                if not ffmpeg or not os.path.exists(ffmpeg):
+                    raise RuntimeError(
+                        f"Video is {size//1024//1024}MB but sync.so limit is 20MB. "
+                        "Install ffmpeg to auto-compress, or use a shorter/smaller video."
+                    )
+                compressed = video_path.replace(".mp4", "_sync_compressed.mp4")
+                import subprocess
+                result = subprocess.run([
+                    ffmpeg, "-y", "-i", video_path,
+                    "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                    "-c:a", "aac", "-b:a", "128k",
+                    compressed
+                ], capture_output=True, timeout=120)
+                if result.returncode != 0 or not os.path.exists(compressed):
+                    raise RuntimeError(f"ffmpeg compression failed: {result.stderr.decode()[:200]}")
+                new_size = os.path.getsize(compressed)
+                print(f"[Sync] Compressed: {size//1024//1024}MB → {new_size//1024//1024}MB")
+                video_path = compressed
 
-        if audio_path and Path(audio_path).exists():
-            files["audio"] = open(audio_path, "rb")
-        elif audio_url:
-            fields.append(("audio_url", audio_url))
+        # ── Submit ────────────────────────────────────────────────────────
+        # Build options (snake_case as expected by the multipart endpoint)
+        options = {
+            "sync_mode": sync_mode,
+            "temperature": temperature,
+        }
+        if active_speaker:
+            options["active_speaker_detection"] = {"auto_detect": True}
+        if occlusion_detection:
+            options["occlusion_detection_enabled"] = True
 
-        print(f"[Sync] Submitting job — model={model}")
-        res = requests.post("https://api.sync.so/v2/generate",
-                            headers=headers, data=fields, files=files or None)
-        for f in files.values():
-            f.close()
+        # Determine if we upload files or use URLs
+        has_video_file = video_path and Path(video_path).exists()
+        has_audio_file = audio_path and Path(audio_path).exists()
 
+        # Build multipart files with explicit filename + content-type tuples
+        # Format: field_name → (filename, file_obj, content_type)
+        multipart_files = []
+        opened_files = []
+
+        if has_video_file:
+            f = open(video_path, "rb")
+            opened_files.append(f)
+            multipart_files.append(("video", (Path(video_path).name, f, "video/mp4")))
+        if has_audio_file:
+            ext = Path(audio_path).suffix.lower()
+            mime = {"mp3": "audio/mpeg", "wav": "audio/wav",
+                    "ogg": "audio/ogg",  "m4a": "audio/mp4"}.get(ext.lstrip("."), "audio/mpeg")
+            f = open(audio_path, "rb")
+            opened_files.append(f)
+            multipart_files.append(("audio", (Path(audio_path).name, f, mime)))
+
+        # Build form fields — omit `input` when uploading files (per SDK)
+        multipart_data = [("model", model), ("options", json.dumps(options))]
+
+        # Only include `input` for URL-based inputs
+        if not has_video_file and video_url:
+            input_block = [{"type": "video", "url": video_url}]
+            if not has_audio_file and audio_url:
+                input_block.append({"type": "audio", "url": audio_url})
+            multipart_data.append(("input", json.dumps(input_block)))
+        elif not has_audio_file and audio_url:
+            multipart_data.append(("input", json.dumps([{"type": "audio", "url": audio_url}])))
+
+        print(f"[Sync] Submitting — model={model} files={[f[0] for f in multipart_files]}")
+        print(f"[Sync] Options: {json.dumps(options)}")
+
+        try:
+            res = requests.post(
+                "https://api.sync.so/v2/generate",
+                headers=headers,
+                data=multipart_data,
+                files=multipart_files if multipart_files else None,
+            )
+        finally:
+            for f in opened_files:
+                f.close()
+
+        print(f"[Sync] Response {res.status_code}: {res.text[:500]}")
         if res.status_code not in (200, 201):
             raise RuntimeError(f"sync.so error {res.status_code}: {res.text[:400]}")
 
